@@ -1,0 +1,670 @@
+name: Build Footstep Snow FX
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Minecraft 1.21.10 Fabric mod
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.14.3'
+
+      - name: Generate the complete mod project from this single workflow file
+        shell: bash
+        run: |
+          mkdir -p src/main/java/dev/footstepsnowfx src/main/resources/assets/footstepsnowfx/textures
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  maven { url = 'https://maven.fabricmc.net/' }
+                  gradlePluginPortal()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = 'footstepsnowfx'
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2G
+          org.gradle.parallel=true
+          minecraft_version=1.21.10
+          yarn_mappings=1.21.10+build.3
+          loader_version=0.17.2
+          fabric_api_version=0.138.4+1.21.10
+          mod_version=1.2.2
+          maven_group=dev.footstepsnowfx
+          archives_base_name=footstepsnowfx
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'fabric-loom' version '1.13.3'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+
+          base {
+              archivesName = project.archives_base_name
+          }
+
+          repositories {
+              mavenCentral()
+          }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+              modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+              // Explicitly include the client world-render event module used by the snow mesh renderer.
+              modImplementation "net.fabricmc.fabric-api:fabric-rendering-v1:16.2.2+129f1f4c4e"
+          }
+
+          processResources {
+              inputs.property 'version', project.version
+              filesMatching('fabric.mod.json') {
+                  expand 'version': project.version
+              }
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              options.release = 21
+              options.encoding = 'UTF-8'
+          }
+
+          java {
+              sourceCompatibility = JavaVersion.VERSION_21
+              targetCompatibility = JavaVersion.VERSION_21
+              withSourcesJar()
+          }
+          EOF
+
+          cat > src/main/resources/fabric.mod.json <<'EOF'
+          {
+            "schemaVersion": 1,
+            "id": "footstepsnowfx",
+            "version": "${version}",
+            "name": "Footstep Snow FX - Open Sky Snow Cover",
+            "description": "Client-side uneven snow cover only on surfaces with 128 blocks of overhead clearance, with temporary footprints and regrowth.",
+            "environment": "client",
+            "entrypoints": {
+              "client": [
+                "dev.footstepsnowfx.FootstepSnowFxClient"
+              ]
+            },
+            "depends": {
+              "fabricloader": ">=0.17.2",
+              "minecraft": "1.21.10",
+              "java": ">=21",
+              "fabric-api": "*"
+            }
+          }
+          EOF
+
+          # A one-pixel opaque white texture lets the mod render its own colored snow mesh.
+          python3 - <<'PY'
+          import struct, zlib
+          from pathlib import Path
+          def chunk(kind, data):
+              body = kind + data
+              return struct.pack('>I', len(data)) + body + struct.pack('>I', zlib.crc32(body) & 0xffffffff)
+          png = b'\x89PNG\r\n\x1a\n'
+          png += chunk(b'IHDR', struct.pack('>2I5B', 1, 1, 8, 6, 0, 0, 0))
+          png += chunk(b'IDAT', zlib.compress(b'\x00\xff\xff\xff\xff'))
+          png += chunk(b'IEND', b'')
+          Path('src/main/resources/assets/footstepsnowfx/textures/white.png').write_bytes(png)
+          PY
+
+          cat > src/main/java/dev/footstepsnowfx/FootstepSnowFxClient.java <<'EOF'
+          package dev.footstepsnowfx;
+
+          import java.io.BufferedReader;
+          import java.io.BufferedWriter;
+          import java.io.IOException;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.util.ArrayDeque;
+          import java.util.ArrayList;
+          import java.util.List;
+          import java.util.Properties;
+          import java.util.Random;
+          import java.util.Set;
+
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+          import net.fabricmc.fabric.api.client.rendering.v1.WorldRenderEvents;
+          import net.fabricmc.loader.api.FabricLoader;
+          import net.minecraft.block.BlockState;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.render.Camera;
+          import net.minecraft.client.render.OverlayTexture;
+          import net.minecraft.client.render.RenderLayer;
+          import net.minecraft.client.render.VertexConsumer;
+          import net.minecraft.client.render.VertexConsumerProvider;
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.gui.screen.Screen;
+          import net.minecraft.client.gui.widget.ButtonWidget;
+          import net.minecraft.client.option.KeyBinding;
+          import net.minecraft.client.util.InputUtil;
+          import net.minecraft.registry.Registries;
+          import net.minecraft.util.Identifier;
+          import net.minecraft.util.math.BlockPos;
+          import net.minecraft.util.math.Box;
+          import net.minecraft.util.shape.VoxelShape;
+          import net.minecraft.text.Text;
+          import net.minecraft.world.Heightmap;
+          import net.minecraft.world.World;
+          import org.lwjgl.glfw.GLFW;
+
+          public final class FootstepSnowFxClient implements ClientModInitializer {
+              private static final Identifier WHITE_TEXTURE = Identifier.of("footstepsnowfx", "textures/white.png");
+              private static final long REPLENISH_DELAY_TICKS = 60L;
+              private static final long REPLENISH_FADE_TICKS = 20L;
+              private static final int MAX_FOOTPRINTS = 120;
+              private static final Set<String> WORKSTATION_BLOCKS = Set.of(
+                  "crafting_table", "furnace", "blast_furnace", "smoker", "smithing_table",
+                  "fletching_table", "cartography_table", "loom", "grindstone", "stonecutter",
+                  "enchanting_table", "brewing_stand", "anvil", "chipped_anvil", "damaged_anvil",
+                  "lectern", "chest", "trapped_chest", "ender_chest", "barrel", "hopper",
+                  "dispenser", "dropper", "shulker_box", "jukebox", "note_block", "bell",
+                  "composter", "beacon", "cauldron", "crafter", "decorated_pot", "campfire",
+                  "soul_campfire"
+              );
+
+              private static KeyBinding openSettingsKey;
+              private static boolean enabled = true;
+              private static int density = 3;
+              private static int unevenness = 3;
+              private static int renderRadius = 7;
+              private static Path configPath;
+              private static boolean rebuildSurfaces = true;
+              private static int scanTicker = 0;
+              private static List<SnowSurface> snowSurfaces = List.of();
+              private static final ArrayDeque<Footprint> footprints = new ArrayDeque<>();
+
+              private static double lastX = Double.NaN;
+              private static double lastZ = Double.NaN;
+              private static double travelledSinceStep = 0.0;
+              private static int nextFoot = 1;
+
+              @Override
+              public void onInitializeClient() {
+                  configPath = FabricLoader.getInstance().getConfigDir().resolve("footstepsnowfx.properties");
+                  loadConfig();
+
+                  openSettingsKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                      "key.footstepsnowfx.open_settings",
+                      InputUtil.Type.KEYSYM,
+                      GLFW.GLFW_KEY_RIGHT_SHIFT,
+                      KeyBinding.Category.MISC
+                  ));
+
+                  ClientTickEvents.END_CLIENT_TICK.register(FootstepSnowFxClient::onClientTick);
+                  WorldRenderEvents.BEFORE_ENTITIES.register(FootstepSnowFxClient::renderSnow);
+              }
+
+              private static void onClientTick(MinecraftClient client) {
+                  if (openSettingsKey.wasPressed() && client.currentScreen == null) {
+                      client.setScreen(new SnowSettingsScreen());
+                  }
+
+                  if (client.player == null || client.world == null) {
+                      lastX = Double.NaN;
+                      lastZ = Double.NaN;
+                      travelledSinceStep = 0.0;
+                      snowSurfaces = List.of();
+                      footprints.clear();
+                      return;
+                  }
+
+                  long now = client.world.getTime();
+                  pruneFootprints(now);
+
+                  if (!enabled) {
+                      snowSurfaces = List.of();
+                      lastX = client.player.getX();
+                      lastZ = client.player.getZ();
+                      travelledSinceStep = 0.0;
+                      return;
+                  }
+
+                  updateFootsteps(client, now);
+
+                  if (rebuildSurfaces || ++scanTicker >= 10) {
+                      scanTicker = 0;
+                      rebuildSurfaces = false;
+                      snowSurfaces = scanNearbySurfaces(client.world, client.player.getBlockPos());
+                  }
+              }
+
+              private static void updateFootsteps(MinecraftClient client, long now) {
+                  double x = client.player.getX();
+                  double z = client.player.getZ();
+
+                  if (Double.isNaN(lastX) || Double.isNaN(lastZ)) {
+                      lastX = x;
+                      lastZ = z;
+                      return;
+                  }
+
+                  double dx = x - lastX;
+                  double dz = z - lastZ;
+                  lastX = x;
+                  lastZ = z;
+
+                  if (!client.player.isOnGround() || client.currentScreen != null) {
+                      travelledSinceStep = 0.0;
+                      return;
+                  }
+
+                  double distance = Math.sqrt(dx * dx + dz * dz);
+                  if (distance < 0.0001) {
+                      return;
+                  }
+
+                  travelledSinceStep += distance;
+                  while (travelledSinceStep >= 0.34) {
+                      travelledSinceStep -= 0.34;
+                      double dirX = dx / distance;
+                      double dirZ = dz / distance;
+                      double side = 0.085 * nextFoot;
+                      nextFoot = -nextFoot;
+                      double footX = x - dirZ * side;
+                      double footZ = z + dirX * side;
+                      footprints.addLast(new Footprint(footX, client.player.getY(), footZ, dirX, dirZ,
+                          now + REPLENISH_DELAY_TICKS));
+                      while (footprints.size() > MAX_FOOTPRINTS) {
+                          footprints.removeFirst();
+                      }
+                  }
+              }
+
+              private static void pruneFootprints(long now) {
+                  footprints.removeIf(footprint -> now > footprint.restoreAt + REPLENISH_FADE_TICKS);
+              }
+
+              private static List<SnowSurface> scanNearbySurfaces(World world, BlockPos playerPos) {
+                  List<SnowSurface> found = new ArrayList<>();
+                  int baseY = playerPos.getY();
+                  int centerX = playerPos.getX();
+                  int centerZ = playerPos.getZ();
+
+                  for (int x = centerX - renderRadius; x <= centerX + renderRadius; x++) {
+                      for (int z = centerZ - renderRadius; z <= centerZ + renderRadius; z++) {
+                          for (int y = baseY - 3; y <= baseY + 1; y++) {
+                              BlockPos pos = new BlockPos(x, y, z);
+                              BlockState state = world.getBlockState(pos);
+                              if (!isAllowedSurface(world, pos, state)) {
+                                  continue;
+                              }
+
+                              VoxelShape shape = state.getCollisionShape(world, pos);
+                              if (shape.isEmpty()) {
+                                  continue;
+                              }
+
+                              for (Box box : shape.getBoundingBoxes()) {
+                                  double width = box.maxX - box.minX;
+                                  double depth = box.maxZ - box.minZ;
+                                  if (box.maxY <= box.minY || width < 0.32 || depth < 0.32) {
+                                      continue;
+                                  }
+
+                                  found.add(createSurface(pos, box));
+                                  if (found.size() >= 900) {
+                                      return found;
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  return found;
+              }
+
+              private static boolean isAllowedSurface(World world, BlockPos pos, BlockState state) {
+                  if (state.isAir() || state.hasBlockEntity() || !state.getFluidState().isEmpty()) {
+                      return false;
+                  }
+
+                  // Snow is only shown outdoors: every position directly above this surface
+                  // must be air for the first 128 blocks. This also excludes rooms, roofs,
+                  // caves with a nearby ceiling, and surfaces under trees or other blocks.
+                  if (!hasOpenSkyClearance(world, pos)) {
+                      return false;
+                  }
+
+                  String path = Registries.BLOCK.getId(state.getBlock()).getPath();
+                  if (WORKSTATION_BLOCKS.contains(path)) {
+                      return false;
+                  }
+
+                  // Catch common workstation variants from modded blocks too.
+                  if (path.endsWith("_crafting_table") || path.endsWith("_furnace")
+                      || path.endsWith("_smithing_table") || path.endsWith("_cartography_table")
+                      || path.endsWith("_fletching_table") || path.endsWith("_enchanting_table")
+                      || path.endsWith("_brewing_stand") || path.endsWith("_stonecutter")
+                      || path.endsWith("_grindstone") || path.endsWith("_loom")) {
+                      return false;
+                  }
+
+                  return true;
+              }
+
+              private static boolean hasOpenSkyClearance(World world, BlockPos surfacePos) {
+                  int firstY = surfacePos.getY() + 1;
+                  int lastY = Math.min(surfacePos.getY() + 128, world.getTopYInclusive());
+                  if (firstY > lastY) {
+                      return true;
+                  }
+
+                  // Fast path for ordinary outdoor terrain: WORLD_SURFACE returns
+                  // the position of the highest non-air block in this column.
+                  // If that block is this surface, nothing covers it.
+                  int columnTopY = world.getTopPosition(Heightmap.Type.WORLD_SURFACE, surfacePos).getY();
+                  if (columnTopY <= surfacePos.getY()) {
+                      return true;
+                  }
+
+                  // A highest block within the clearance range proves that the
+                  // surface is covered. If it is farther away, inspect the 128-block
+                  // window explicitly so a nearer roof cannot be missed.
+                  if (columnTopY <= lastY) {
+                      return false;
+                  }
+
+                  BlockPos.Mutable checkPos = new BlockPos.Mutable(surfacePos.getX(), firstY, surfacePos.getZ());
+                  for (int y = firstY; y <= lastY; y++) {
+                      checkPos.set(surfacePos.getX(), y, surfacePos.getZ());
+                      if (!world.getBlockState(checkPos).isAir()) {
+                          return false;
+                      }
+                  }
+                  return true;
+              }
+
+              private static SnowSurface createSurface(BlockPos pos, Box box) {
+                  int steps = 2 + density;
+                  double[][] heights = new double[steps + 1][steps + 1];
+                  int[][] shades = new int[steps + 1][steps + 1];
+                  long seed = pos.asLong() ^ (Double.doubleToLongBits(box.maxY) << 1)
+                      ^ (density * 97L) ^ (unevenness * 193L);
+                  Random random = new Random(seed);
+
+                  for (int gx = 0; gx <= steps; gx++) {
+                      for (int gz = 0; gz <= steps; gz++) {
+                          boolean edge = gx == 0 || gz == 0 || gx == steps || gz == steps;
+                          double height;
+                          if (edge) {
+                              height = 0.004 + random.nextDouble() * 0.004;
+                          } else {
+                              height = 0.009 + random.nextDouble() * (0.018 + unevenness * 0.009);
+                          }
+                          heights[gx][gz] = height;
+                          shades[gx][gz] = 235 + random.nextInt(18);
+                      }
+                  }
+
+                  return new SnowSurface(pos.toImmutable(), pos.getX() + box.minX, pos.getX() + box.maxX,
+                      pos.getY() + box.maxY, pos.getZ() + box.minZ, pos.getZ() + box.maxZ,
+                      steps, heights, shades);
+              }
+
+              private static void renderSnow(net.fabricmc.fabric.api.client.rendering.v1.WorldRenderContext context) {
+                  if (!enabled || context.world() == null || snowSurfaces.isEmpty() || context.consumers() == null) {
+                      return;
+                  }
+
+                  VertexConsumerProvider consumers = context.consumers();
+                  VertexConsumer vertex = consumers.getBuffer(RenderLayer.getEntityCutoutNoCull(WHITE_TEXTURE));
+                  Camera camera = context.camera();
+                  double cameraX = camera.getPos().x;
+                  double cameraY = camera.getPos().y;
+                  double cameraZ = camera.getPos().z;
+                  long now = context.world().getTime();
+
+                  for (SnowSurface surface : snowSurfaces) {
+                      double cellWidth = (surface.maxX - surface.minX) / surface.steps;
+                      double cellDepth = (surface.maxZ - surface.minZ) / surface.steps;
+
+                      for (int gx = 0; gx < surface.steps; gx++) {
+                          for (int gz = 0; gz < surface.steps; gz++) {
+                              double x0 = surface.minX + cellWidth * gx;
+                              double x1 = surface.minX + cellWidth * (gx + 1);
+                              double z0 = surface.minZ + cellDepth * gz;
+                              double z1 = surface.minZ + cellDepth * (gz + 1);
+                              double centerX = (x0 + x1) * 0.5;
+                              double centerZ = (z0 + z1) * 0.5;
+                              double stomp = footprintStrength(centerX, surface.baseY, centerZ,
+                                  cellWidth, cellDepth, now);
+
+                              if (stomp >= 0.76) {
+                                  continue;
+                              }
+
+                              double remaining = 1.0 - stomp;
+                              double y00 = surface.baseY + 0.002 + surface.heights[gx][gz] * remaining;
+                              double y10 = surface.baseY + 0.002 + surface.heights[gx + 1][gz] * remaining;
+                              double y11 = surface.baseY + 0.002 + surface.heights[gx + 1][gz + 1] * remaining;
+                              double y01 = surface.baseY + 0.002 + surface.heights[gx][gz + 1] * remaining;
+
+                              int c00 = surface.shades[gx][gz];
+                              int c10 = surface.shades[gx + 1][gz];
+                              int c11 = surface.shades[gx + 1][gz + 1];
+                              int c01 = surface.shades[gx][gz + 1];
+
+                              putVertex(vertex, x0, y00, z0, cameraX, cameraY, cameraZ, c00);
+                              putVertex(vertex, x1, y10, z0, cameraX, cameraY, cameraZ, c10);
+                              putVertex(vertex, x1, y11, z1, cameraX, cameraY, cameraZ, c11);
+                              putVertex(vertex, x0, y01, z1, cameraX, cameraY, cameraZ, c01);
+                          }
+                      }
+                  }
+              }
+
+              private static double footprintStrength(double x, double y, double z,
+                                                      double cellWidth, double cellDepth, long now) {
+                  double strongest = 0.0;
+                  for (Footprint footprint : footprints) {
+                      if (Math.abs(y - footprint.y) > 0.85) {
+                          continue;
+                      }
+
+                      double elapsed = now - footprint.restoreAt;
+                      double strength = elapsed <= 0 ? 1.0
+                          : Math.max(0.0, 1.0 - (double) elapsed / REPLENISH_FADE_TICKS);
+                      if (strength <= strongest) {
+                          continue;
+                      }
+
+                      double dx = x - footprint.x;
+                      double dz = z - footprint.z;
+                      double along = dx * footprint.dirX + dz * footprint.dirZ;
+                      double across = -dx * footprint.dirZ + dz * footprint.dirX;
+                      double length = 0.18 + cellWidth * 0.62;
+                      double width = 0.105 + cellDepth * 0.62;
+                      double normalized = (along * along) / (length * length)
+                          + (across * across) / (width * width);
+                      if (normalized <= 1.0) {
+                          strongest = strength;
+                      }
+                  }
+                  return strongest;
+              }
+
+              private static void putVertex(VertexConsumer vertex, double x, double y, double z,
+                                            double cameraX, double cameraY, double cameraZ, int shade) {
+                  int blue = Math.min(255, shade + 7);
+                  vertex.vertex((float) (x - cameraX), (float) (y - cameraY), (float) (z - cameraZ))
+                      .color(shade, Math.min(255, shade + 4), blue, 255)
+                      .texture(0.5f, 0.5f)
+                      .overlay(OverlayTexture.DEFAULT_UV)
+                      .light(15, 15)
+                      .normal(0.0f, 1.0f, 0.0f);
+              }
+
+              private static void loadConfig() {
+                  if (configPath == null || !Files.exists(configPath)) {
+                      return;
+                  }
+
+                  Properties properties = new Properties();
+                  try (BufferedReader reader = Files.newBufferedReader(configPath)) {
+                      properties.load(reader);
+                      enabled = Boolean.parseBoolean(properties.getProperty("enabled", "true"));
+                      density = clamp(Integer.parseInt(properties.getProperty("density", "3")), 1, 5);
+                      unevenness = clamp(Integer.parseInt(properties.getProperty("unevenness", "3")), 1, 5);
+                      renderRadius = clamp(Integer.parseInt(properties.getProperty("radius", "7")), 4, 10);
+                  } catch (IOException | NumberFormatException exception) {
+                      System.err.println("[Footstep Snow FX] Could not read config: " + exception.getMessage());
+                  }
+              }
+
+              private static void saveConfig() {
+                  if (configPath == null) {
+                      return;
+                  }
+
+                  Properties properties = new Properties();
+                  properties.setProperty("enabled", Boolean.toString(enabled));
+                  properties.setProperty("density", Integer.toString(density));
+                  properties.setProperty("unevenness", Integer.toString(unevenness));
+                  properties.setProperty("radius", Integer.toString(renderRadius));
+
+                  try {
+                      Files.createDirectories(configPath.getParent());
+                      try (BufferedWriter writer = Files.newBufferedWriter(configPath)) {
+                          properties.store(writer, "Footstep Snow FX settings");
+                      }
+                  } catch (IOException exception) {
+                      System.err.println("[Footstep Snow FX] Could not save config: " + exception.getMessage());
+                  }
+              }
+
+              private static int clamp(int value, int min, int max) {
+                  return Math.max(min, Math.min(max, value));
+              }
+
+              private static Text enabledButtonText() {
+                  return Text.literal("Snow accumulation: " + (enabled ? "ON" : "OFF"));
+              }
+
+              private static Text densityButtonText() {
+                  return Text.literal("Surface detail: " + density + "/5");
+              }
+
+              private static Text unevennessButtonText() {
+                  return Text.literal("Snow unevenness: " + unevenness + "/5");
+              }
+
+              private static Text radiusButtonText() {
+                  return Text.literal("Render radius: " + renderRadius + " blocks");
+              }
+
+              private static final class SnowSettingsScreen extends Screen {
+                  private SnowSettingsScreen() {
+                      super(Text.literal("Footstep Snow FX"));
+                  }
+
+                  @Override
+                  protected void init() {
+                      int center = this.width / 2;
+                      int top = this.height / 2 - 55;
+
+                      this.addDrawableChild(ButtonWidget.builder(enabledButtonText(), button -> {
+                          enabled = !enabled;
+                          button.setMessage(enabledButtonText());
+                          rebuildSurfaces = true;
+                          saveConfig();
+                      }).dimensions(center - 105, top, 210, 20).build());
+
+                      this.addDrawableChild(ButtonWidget.builder(densityButtonText(), button -> {
+                          density = density >= 5 ? 1 : density + 1;
+                          button.setMessage(densityButtonText());
+                          rebuildSurfaces = true;
+                          saveConfig();
+                      }).dimensions(center - 105, top + 26, 210, 20).build());
+
+                      this.addDrawableChild(ButtonWidget.builder(unevennessButtonText(), button -> {
+                          unevenness = unevenness >= 5 ? 1 : unevenness + 1;
+                          button.setMessage(unevennessButtonText());
+                          rebuildSurfaces = true;
+                          saveConfig();
+                      }).dimensions(center - 105, top + 52, 210, 20).build());
+
+                      this.addDrawableChild(ButtonWidget.builder(radiusButtonText(), button -> {
+                          renderRadius = renderRadius >= 10 ? 4 : renderRadius + 1;
+                          button.setMessage(radiusButtonText());
+                          rebuildSurfaces = true;
+                          saveConfig();
+                      }).dimensions(center - 105, top + 78, 210, 20).build());
+
+                      this.addDrawableChild(ButtonWidget.builder(Text.literal("Done"), button -> this.close())
+                          .dimensions(center - 105, top + 108, 210, 20).build());
+                  }
+
+                  @Override
+                  public void render(DrawContext context, int mouseX, int mouseY, float delta) {
+                      this.renderBackground(context, mouseX, mouseY, delta);
+                      context.drawCenteredTextWithShadow(this.textRenderer, this.title,
+                          this.width / 2, this.height / 2 - 85, 0xFFFFFF);
+                      context.drawCenteredTextWithShadow(this.textRenderer,
+                          Text.literal("Open sky only • 128-block clearance • footprints refill after 3 seconds"),
+                          this.width / 2, this.height / 2 - 68, 0xD9EEFF);
+                      super.render(context, mouseX, mouseY, delta);
+                  }
+
+                  @Override
+                  public void close() {
+                      if (this.client != null) {
+                          this.client.setScreen(null);
+                      }
+                  }
+
+                  @Override
+                  public boolean shouldPause() {
+                      return false;
+                  }
+              }
+
+              private record SnowSurface(BlockPos pos, double minX, double maxX, double baseY,
+                                         double minZ, double maxZ, int steps,
+                                         double[][] heights, int[][] shades) { }
+
+              private record Footprint(double x, double y, double z, double dirX, double dirZ,
+                                       long restoreAt) { }
+          }
+          EOF
+
+      - name: Compile mod JAR
+        run: gradle --no-daemon build
+
+      - name: Upload compiled JAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: footstepsnowfx-mc1.21.10-fabric-v1.2.0
+          path: build/libs/*.jar
+          if-no-files-found: error
+          retention-days: 14
